@@ -154,76 +154,16 @@ pub(super) fn patch_metadata_desktop(metadata_path: &Path, new_version: &str) ->
     Ok(())
 }
 
-/// Patches only the `KPackageStructure` field of a `metadata.json` file to match
-/// the given component type. A no-op if the field is already correct or if the
-/// component type has no kpackage type.
-fn patch_kpackage_structure(metadata_path: &Path, component_type: ComponentType) -> Result<()> {
-    let Some(kpackage_type) = component_type.kpackage_type() else {
-        return Ok(());
-    };
-
-    let content = fs::read_to_string(metadata_path)?;
-    let mut json: serde_json::Value =
-        serde_json::from_str(&content).map_err(Error::MetadataParse)?;
-
-    if json.get("KPackageStructure").and_then(|v| v.as_str()) == Some(kpackage_type) {
-        return Ok(());
-    }
-
-    json["KPackageStructure"] = serde_json::Value::String(kpackage_type.to_string());
-    let patched = serde_json::to_string_pretty(&json)?;
-    privilege::write_file(metadata_path, patched.as_bytes())?;
-
-    Ok(())
-}
-
-/// Scans the parent directory of `installed_component_path` and ensures every
-/// sibling package directory has the correct `KPackageStructure` in its
-/// `metadata.json`.  This pre-patches all packages so that `kpackagetool6 -u`
-/// doesn't exit non-zero because of unrelated packages that ship without the
-/// field (a common issue with plasmoids downloaded from the KDE Store).
-///
-/// Errors are logged and skipped rather than propagated — a failure to patch a
-/// sibling must never block the update of the target package.
-fn patch_sibling_kpackage_structures(installed_component_path: &Path, component_type: ComponentType) {
-    let Some(parent_dir) = installed_component_path.parent() else {
-        return;
-    };
-
-    let Ok(entries) = fs::read_dir(parent_dir) else {
-        return;
-    };
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-
-        let metadata_path = path.join("metadata.json");
-        if !metadata_path.exists() {
-            continue;
-        }
-
-        if let Err(e) = patch_kpackage_structure(&metadata_path, component_type) {
-            log::debug!(
-                target: "patch",
-                "could not patch KPackageStructure for {}: {e}",
-                path.display(),
-            );
-        }
-    }
-}
-
 /// Returns `true` when `error` is an `InstallFailed` whose entire kpackagetool6
-/// stderr consists exclusively of `KPackageStructure … does not match requested
+/// output consists exclusively of `KPackageStructure … does not match requested
 /// format` lines.  These messages are emitted for *other* packages in the same
-/// directory and do not indicate that the target package itself failed to install.
+/// directory and indicate that sibling plasmoids have missing or wrong
+/// `KPackageStructure` entries — not that the target package itself is bad.
 ///
-/// The check relies on a substring of kpackagetool6's error output. If a future
-/// kpackagetool6 release changes this wording, the fallback copy path will simply
-/// not trigger and the original error will be reported instead — a safe default.
-fn is_kpackage_structure_only_error(error: &Error) -> bool {
+/// The check relies on a substring of kpackagetool6's output. If a future
+/// kpackagetool6 release changes this wording, the detection will simply not
+/// trigger and the original error will be reported instead — a safe default.
+fn is_sibling_kpackage_structure_error(error: &Error) -> bool {
     let Error::InstallFailed(msg) = error else {
         return false;
     };
@@ -244,6 +184,83 @@ fn is_kpackage_structure_only_error(error: &Error) -> bool {
         }
     }
     has_lines
+}
+
+/// Attempts to add a missing `KPackageStructure` field to `metadata.json`.
+///
+/// Only writes to disk when the field is clearly absent (not present, or
+/// null/empty). Returns `Ok(true)` if the file was patched, `Ok(false)` if
+/// the field was already present and no change was needed.
+fn add_kpackage_structure_if_missing(
+    metadata_path: &Path,
+    kpackage_type: &str,
+    component_name: &str,
+) -> Result<bool> {
+    let content = fs::read_to_string(metadata_path)?;
+    let mut json: serde_json::Value =
+        serde_json::from_str(&content).map_err(Error::MetadataParse)?;
+
+    let needs_patch = match json.get("KPackageStructure") {
+        None => true,
+        Some(v) => v.as_str().map(|s| s.is_empty()).unwrap_or(true),
+    };
+
+    if !needs_patch {
+        return Ok(false);
+    }
+
+    json["KPackageStructure"] = serde_json::Value::String(kpackage_type.to_string());
+    let patched = serde_json::to_string_pretty(&json)?;
+    privilege::write_file(metadata_path, patched.as_bytes())?;
+
+    log::info!(
+        target: "repair",
+        "added KPackageStructure = {kpackage_type:?} to {} ({})",
+        metadata_path.display(),
+        component_name,
+    );
+
+    Ok(true)
+}
+
+/// Scans a list of installed components and adds the correct `KPackageStructure`
+/// field to any `metadata.json` that is missing it.
+///
+/// This is the implementation for **repair mode** — it must not be called during
+/// the normal update flow.  Only components that use `kpackagetool6` (i.e., have
+/// a `kpackage_type()`) are considered.  The field is only added when it is
+/// clearly absent; existing values are never overwritten.
+///
+/// Returns a pair of `(patched_names, error_pairs)` where `patched_names` is the
+/// list of component names whose files were changed, and `error_pairs` is a list
+/// of `(component_name, error_message)` for files that could not be read or written.
+pub(crate) fn repair_kpackage_structures(
+    components: &[crate::types::InstalledComponent],
+) -> (Vec<String>, Vec<(String, String)>) {
+    let mut patched = Vec::new();
+    let mut errors = Vec::new();
+
+    for component in components {
+        let Some(kpackage_type) = component.component_type.kpackage_type() else {
+            continue;
+        };
+
+        let metadata_path = component.path.join("metadata.json");
+        if !metadata_path.exists() {
+            continue;
+        }
+
+        match add_kpackage_structure_if_missing(&metadata_path, kpackage_type, &component.name) {
+            Ok(true) => patched.push(component.name.clone()),
+            Ok(false) => {}
+            Err(e) => errors.push((
+                component.name.clone(),
+                format!("failed to patch {}: {e}", metadata_path.display()),
+            )),
+        }
+    }
+
+    (patched, errors)
 }
 
 /// Installs or updates a component package using `kpackagetool6`.
@@ -275,13 +292,19 @@ fn install_via_kpackagetool(
 
     if !output.status.success() {
         // kpackagetool6 sends KPackageStructure warnings to stdout on some versions,
-        // stderr on others. Combine both so the fallback heuristic can inspect them.
+        // stderr on others. Combine both so the caller can inspect the full output.
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
-        let combined = match (stdout.trim().is_empty(), stderr.trim().is_empty()) {
-            (false, false) => format!("{}\n{}", stdout.trim(), stderr.trim()),
-            (false, true) => stdout.trim().to_string(),
-            (_, _) => stderr.trim().to_string(),
+        let stdout = stdout.trim();
+        let stderr = stderr.trim();
+        let combined = if !stdout.is_empty() && !stderr.is_empty() {
+            format!("{stdout}\n{stderr}")
+        } else if !stdout.is_empty() {
+            stdout.to_string()
+        } else if !stderr.is_empty() {
+            stderr.to_string()
+        } else {
+            "(no output)".to_string()
         };
         return Err(Error::install(format!("kpackagetool6 failed: {combined}")));
     }
@@ -312,32 +335,34 @@ pub(super) fn install_via_kpackage(
         log::warn!(target: "patch", "failed to patch metadata.desktop for {}: {e}", component.name);
     }
 
-    // Pre-patch KPackageStructure in ALL packages in the same directory before
-    // running `kpackagetool6 -u`. kpackagetool6 validates every package in the
-    // directory, not just the one being updated, and exits non-zero if any of them
-    // have a missing or wrong KPackageStructure. This mirrors what the user must
-    // otherwise do manually.
-    patch_sibling_kpackage_structures(&component.path, component.component_type);
+    // Intentionally NOT scanning sibling packages here: silently rewriting files
+    // that belong to other plasmoids the user did not ask to update is unexpected
+    // behaviour.  If kpackagetool6 reports KPackageStructure errors for sibling
+    // packages, a clear error is returned below instead.  Use
+    // `plasmoid-updater repair` to fix broken packages explicitly.
 
     let is_global = privilege::is_system_path(&component.path);
     match install_via_kpackagetool(&package_dir, component.component_type, is_global) {
         Ok(()) => Ok(()),
-        Err(ref e) if is_kpackage_structure_only_error(e) => {
-            // kpackagetool6 exited non-zero solely because *other* already-installed
-            // packages in the same directory have an incorrect KPackageStructure.
-            // Those packages are unrelated to the one being updated; fall back to a
-            // direct directory replacement to bypass that validation entirely.
-            log::warn!(
-                target: "install",
-                "kpackagetool6 reported KPackageStructure mismatch(es) in other packages; \
-                 falling back to direct copy for {}",
-                component.name,
-            );
-            replace_destination(&component.path, || {
-                privilege::create_dir_all(&component.path)?;
-                privilege::copy_dir(&package_dir, &component.path)?;
-                Ok(())
-            })
+        Err(e) if is_sibling_kpackage_structure_error(&e) => {
+            // kpackagetool6 rejected the update solely because one or more
+            // *other* installed packages in the same directory are missing the
+            // KPackageStructure field.  Rather than silently patching unrelated
+            // plasmoids, we surface a descriptive error so the user can decide
+            // whether to run repair mode.
+            let err_str = e.to_string();
+            let kpackage_output = err_str
+                .strip_prefix("installation failed: ")
+                .unwrap_or(&err_str);
+            Err(Error::install(format!(
+                "update blocked: one or more installed plasmoids in your plasma install \
+                 directory have a missing or incorrect KPackageStructure field in their \
+                 metadata.json. kpackagetool6 validates all packages in the same directory \
+                 and rejects updates when any of them are malformed. \
+                 Run 'plasmoid-updater repair' to add the missing field to affected \
+                 packages, then retry the update.\n\
+                 kpackagetool6 output: {kpackage_output}"
+            )))
         }
         Err(e) => Err(e),
     }
@@ -543,4 +568,202 @@ pub(super) fn install_raw_file(downloaded: &Path, component: &InstalledComponent
         log::debug!(target: "install", "copied raw file to {}", dest.display());
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+    use crate::types::{ComponentType, InstalledComponent};
+
+    fn make_component(name: &str, dir: &std::path::Path, ct: ComponentType) -> InstalledComponent {
+        InstalledComponent {
+            name: name.to_string(),
+            directory_name: name.to_string(),
+            version: "1.0".to_string(),
+            component_type: ct,
+            path: dir.to_path_buf(),
+            is_system: false,
+            release_date: String::new(),
+        }
+    }
+
+    // --- is_sibling_kpackage_structure_error ---
+
+    #[test]
+    fn sibling_error_detected_single_line() {
+        let err = Error::install(
+            "kpackagetool6 failed: Package type \"Plasma/Applet\" does not match requested format",
+        );
+        assert!(is_sibling_kpackage_structure_error(&err));
+    }
+
+    #[test]
+    fn sibling_error_detected_multi_line() {
+        let err = Error::install(
+            "kpackagetool6 failed: \
+             Package type \"KWin/Script\" does not match requested format\n\
+             Package type \"Plasma/Applet\" does not match requested format",
+        );
+        assert!(is_sibling_kpackage_structure_error(&err));
+    }
+
+    #[test]
+    fn sibling_error_not_detected_for_other_errors() {
+        let err = Error::install("kpackagetool6 failed: some other error");
+        assert!(!is_sibling_kpackage_structure_error(&err));
+    }
+
+    #[test]
+    fn sibling_error_not_detected_for_mixed_output() {
+        // When kpackagetool6 output contains BOTH a KPackageStructure line AND
+        // an unrelated error, we should NOT identify this as a sibling-only error.
+        let err = Error::install(
+            "kpackagetool6 failed: \
+             Package type \"Plasma/Applet\" does not match requested format\n\
+             Error: Could not install package",
+        );
+        assert!(!is_sibling_kpackage_structure_error(&err));
+    }
+
+    #[test]
+    fn sibling_error_not_detected_for_empty_body() {
+        let err = Error::install("kpackagetool6 failed: ");
+        assert!(!is_sibling_kpackage_structure_error(&err));
+    }
+
+    #[test]
+    fn sibling_error_not_detected_for_wrong_variant() {
+        let err = Error::DownloadFailed(
+            "does not match requested format".to_string(),
+        );
+        assert!(!is_sibling_kpackage_structure_error(&err));
+    }
+
+    // --- add_kpackage_structure_if_missing ---
+
+    #[test]
+    fn adds_kpackage_structure_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("metadata.json");
+        std::fs::write(&path, r#"{"KPlugin": {"Name": "Test"}}"#).unwrap();
+
+        let patched = add_kpackage_structure_if_missing(&path, "Plasma/Applet", "Test").unwrap();
+        assert!(patched);
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(json["KPackageStructure"].as_str(), Some("Plasma/Applet"));
+    }
+
+    #[test]
+    fn adds_kpackage_structure_when_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("metadata.json");
+        std::fs::write(&path, r#"{"KPackageStructure": ""}"#).unwrap();
+
+        let patched = add_kpackage_structure_if_missing(&path, "Plasma/Applet", "Test").unwrap();
+        assert!(patched);
+    }
+
+    #[test]
+    fn skips_when_kpackage_structure_already_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("metadata.json");
+        std::fs::write(&path, r#"{"KPackageStructure": "Plasma/Applet"}"#).unwrap();
+
+        let patched = add_kpackage_structure_if_missing(&path, "Plasma/Applet", "Test").unwrap();
+        assert!(!patched);
+    }
+
+    #[test]
+    fn skips_when_different_kpackage_structure_already_present() {
+        // An existing (even "wrong") value should never be overwritten in repair mode.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("metadata.json");
+        std::fs::write(&path, r#"{"KPackageStructure": "KWin/Script"}"#).unwrap();
+
+        let patched =
+            add_kpackage_structure_if_missing(&path, "Plasma/Applet", "Test").unwrap();
+        assert!(!patched);
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(json["KPackageStructure"].as_str(), Some("KWin/Script"));
+    }
+
+    // --- repair_kpackage_structures ---
+
+    #[test]
+    fn repair_patches_components_missing_field() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // PlasmaWidget with missing KPackageStructure
+        let widget_dir = dir.path().join("my.widget");
+        std::fs::create_dir_all(&widget_dir).unwrap();
+        std::fs::write(
+            widget_dir.join("metadata.json"),
+            r#"{"KPlugin": {"Name": "My Widget", "Version": "1.0"}}"#,
+        )
+        .unwrap();
+
+        let component = make_component("My Widget", &widget_dir, ComponentType::PlasmaWidget);
+        let (patched, errors) = repair_kpackage_structures(&[component]);
+
+        assert_eq!(patched, vec!["My Widget"]);
+        assert!(errors.is_empty());
+
+        let content =
+            std::fs::read_to_string(widget_dir.join("metadata.json")).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(json["KPackageStructure"].as_str(), Some("Plasma/Applet"));
+    }
+
+    #[test]
+    fn repair_skips_non_kpackage_components() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // ColorScheme has no kpackage_type(), should be skipped entirely.
+        let scheme_path = dir.path().join("MyTheme.colors");
+        std::fs::write(&scheme_path, "[ColorEffects:Inactive]\n").unwrap();
+
+        let component = make_component("MyTheme", dir.path(), ComponentType::ColorScheme);
+        let (patched, errors) = repair_kpackage_structures(&[component]);
+
+        assert!(patched.is_empty());
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn repair_skips_component_with_no_metadata_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let widget_dir = dir.path().join("no.metadata");
+        std::fs::create_dir_all(&widget_dir).unwrap();
+        // No metadata.json created.
+
+        let component = make_component("NoMeta", &widget_dir, ComponentType::PlasmaWidget);
+        let (patched, errors) = repair_kpackage_structures(&[component]);
+
+        assert!(patched.is_empty());
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn repair_does_not_overwrite_existing_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let widget_dir = dir.path().join("has.field");
+        std::fs::create_dir_all(&widget_dir).unwrap();
+        std::fs::write(
+            widget_dir.join("metadata.json"),
+            r#"{"KPackageStructure": "Plasma/Applet"}"#,
+        )
+        .unwrap();
+
+        let component = make_component("HasField", &widget_dir, ComponentType::PlasmaWidget);
+        let (patched, errors) = repair_kpackage_structures(&[component]);
+
+        assert!(patched.is_empty());
+        assert!(errors.is_empty());
+    }
 }

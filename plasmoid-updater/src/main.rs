@@ -8,7 +8,7 @@ use clap::{Parser, Subcommand};
 
 use cli_config::CliConfig;
 use exit_code::ExitCode;
-use libplasmoid_updater::{check, show_installed, update};
+use libplasmoid_updater::{check, repair_installed, show_installed, update};
 
 #[derive(Parser)]
 #[command(name = "plasmoid-updater")]
@@ -54,6 +54,17 @@ enum Commands {
     Check,
     #[command(about = "list all installed components")]
     ListInstalled,
+    #[command(
+        about = "repair installed components with missing KPackageStructure",
+        long_about = "Scans all installed plasma components and adds the missing \
+            KPackageStructure field to any metadata.json that does not have it.\n\n\
+            Use this when `plasmoid-updater update` fails with:\n  \
+            \"update blocked: one or more installed plasmoids … have a missing or \
+            incorrect KPackageStructure field\"\n\n\
+            Only components that use kpackagetool6 are examined. \
+            Existing KPackageStructure values are never overwritten."
+    )]
+    Repair,
     #[command(about = "update components")]
     Update {
         #[arg(help = "component name or directory to update")]
@@ -113,6 +124,7 @@ fn execute_command(cli: &Cli, config: &CliConfig) -> Result<ExitCode, libplasmoi
         None => do_update(config, UpdateArgs::default()),
         Some(Commands::Check) => do_check(config),
         Some(Commands::ListInstalled) => do_list_installed(config),
+        Some(Commands::Repair) => do_repair(config),
         Some(Commands::Update {
             component,
             restart_plasma,
@@ -128,6 +140,34 @@ fn execute_command(cli: &Cli, config: &CliConfig) -> Result<ExitCode, libplasmoi
             },
         ),
     }
+}
+
+fn do_repair(config: &CliConfig) -> Result<ExitCode, libplasmoid_updater::Error> {
+    let result = repair_installed(&config.inner)?;
+
+    if result.is_empty() {
+        println!("nothing to repair: all installed components already have KPackageStructure");
+        return Ok(ExitCode::Success);
+    }
+
+    if result.has_patched() {
+        let count = result.patched.len();
+        let plural = if count == 1 { "" } else { "s" };
+        println!("repaired {count} component{plural}:");
+        for name in &result.patched {
+            println!("  {name}");
+        }
+    }
+
+    if result.has_errors() {
+        eprintln!("\nfailed to repair {} component(s):", result.errors.len());
+        for (name, err) in &result.errors {
+            eprintln!("  {name}: {err}");
+        }
+        return Ok(ExitCode::PartialFailure);
+    }
+
+    Ok(ExitCode::Success)
 }
 
 fn do_check(config: &CliConfig) -> Result<ExitCode, libplasmoid_updater::Error> {

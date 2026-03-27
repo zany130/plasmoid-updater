@@ -24,6 +24,7 @@ use crate::{
 use backup::{backup_component, restore_component};
 
 pub(crate) use plasmashell::{any_requires_restart, restart_plasmashell};
+pub(crate) use install::repair_kpackage_structures;
 
 /// Updates a single component using the provided HTTP client.
 ///

@@ -193,7 +193,62 @@ impl UpdateResult {
     }
 }
 
-/// Returns all installed KDE Plasma components without making network requests.
+/// Result of a repair operation.
+///
+/// Returned by [`repair_installed()`](crate::repair_installed).
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RepairResult {
+    /// Names of components whose `metadata.json` was patched.
+    pub patched: Vec<String>,
+    /// Components that could not be repaired, with the reason for each failure.
+    pub errors: Vec<(String, String)>,
+}
+
+impl RepairResult {
+    /// Returns `true` if at least one component was patched.
+    pub fn has_patched(&self) -> bool {
+        !self.patched.is_empty()
+    }
+
+    /// Returns `true` if any repair attempt encountered an error.
+    pub fn has_errors(&self) -> bool {
+        !self.errors.is_empty()
+    }
+
+    /// Returns `true` if nothing was patched and there were no errors.
+    pub fn is_empty(&self) -> bool {
+        self.patched.is_empty() && self.errors.is_empty()
+    }
+}
+
+/// Scans all installed KDE Plasma components and adds the missing
+/// `KPackageStructure` field to any `metadata.json` that does not have it.
+///
+/// This is the **repair mode** entry point.  It is intended to be called
+/// explicitly by the user (via `plasmoid-updater repair`) when
+/// `kpackagetool6` reports KPackageStructure mismatch errors for installed
+/// packages.  Normal update operations never call this function.
+///
+/// Only components whose type uses `kpackagetool6` (i.e., Plasma Widgets,
+/// Wallpaper Plugins, KWin Effects/Scripts/Switchers) are examined.  The
+/// `KPackageStructure` field is added **only when it is clearly absent**
+/// (missing or empty); existing values are never overwritten.  Every file
+/// that is changed is logged at the `info` level under the `"repair"` target.
+///
+/// # Errors
+///
+/// - [`Error::UnsupportedOS`] — not running on Linux
+/// - [`Error::NotKDE`] — KDE Plasma not detected
+pub fn repair_installed(config: &Config) -> Result<RepairResult> {
+    crate::utils::validate_environment(config.skip_plasma_detection)?;
+
+    let components = checker::find_installed(config.system)?;
+    let (patched, errors) = installer::repair_kpackage_structures(&components);
+
+    Ok(RepairResult { patched, errors })
+}
+
+
 ///
 /// Scans the filesystem and KNewStuff registry to discover locally installed components.
 /// Useful for building custom UIs or auditing what is installed.
