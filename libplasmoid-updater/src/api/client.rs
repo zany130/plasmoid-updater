@@ -25,6 +25,17 @@ use super::config::{ApiConfig, CONNECT_TIMEOUT, DEFAULT_API_CONFIG, REQUEST_TIME
 use super::ocs_parser::Meta;
 use super::ocs_parser::{build_category_string, parse_ocs_response};
 
+/// Parses a `Retry-After` header value (integer seconds) into milliseconds.
+/// Returns `None` if the header is absent or not a valid non-negative integer.
+fn parse_retry_after_ms(response: &reqwest::blocking::Response) -> Option<u32> {
+    response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u32>().ok())
+        .map(|secs| secs.saturating_mul(1_000))
+}
+
 /// Thread-safe API client for KDE Store interactions.
 #[derive(Clone)]
 pub(crate) struct ApiClient {
@@ -81,6 +92,21 @@ impl ApiClient {
         Arc::clone(&self.request_count)
     }
 
+    /// Builds a rayon thread pool limited to `max_concurrent_requests` threads.
+    /// Falls back to a single-threaded pool if the build fails.
+    fn build_request_pool(&self) -> rayon::ThreadPool {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(self.config.max_concurrent_requests)
+            .build()
+            .unwrap_or_else(|e| {
+                log::warn!(target: "api", "failed to build thread pool ({e}), falling back to single thread");
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(1)
+                    .build()
+                    .expect("failed to build single-thread fallback pool")
+            })
+    }
+
     /// Fetches all content from specified categories with parallel page fetching.
     pub fn fetch_all(&self, categories: &[ComponentType]) -> Result<Vec<StoreEntry>> {
         let category_str = build_category_string(categories);
@@ -104,19 +130,26 @@ impl ApiClient {
         let all_entries = Arc::new(Mutex::new(first_entries));
         let errors = Arc::new(Mutex::new(Vec::new()));
 
-        remaining_pages.par_iter().for_each(|&page| {
-            let url = format!(
-                "{base_url}/content/data?categories={category_str}&page={page}&pagesize={page_size}&sort=new"
-            );
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(self.config.max_concurrent_requests)
+            .build()
+            .unwrap_or_else(|_| rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap());
 
-            match self.fetch_page(&url) {
-                Ok((entries, _)) => {
-                    all_entries.lock().extend(entries);
+        pool.install(|| {
+            remaining_pages.par_iter().for_each(|&page| {
+                let url = format!(
+                    "{base_url}/content/data?categories={category_str}&page={page}&pagesize={page_size}&sort=new"
+                );
+
+                match self.fetch_page(&url) {
+                    Ok((entries, _)) => {
+                        all_entries.lock().extend(entries);
+                    }
+                    Err(e) => {
+                        errors.lock().push(e);
+                    }
                 }
-                Err(e) => {
-                    errors.lock().push(e);
-                }
-            }
+            });
         });
 
         let errors = Arc::try_unwrap(errors).unwrap().into_inner();
@@ -129,35 +162,76 @@ impl ApiClient {
 
     /// Fetches content details of multiple components.
     pub fn fetch_details(&self, content_ids: &[u64]) -> Vec<Result<StoreEntry>> {
-        content_ids
-            .par_iter()
-            .map(|&id| {
-                let base_url = self.config.base_url;
-                let url = format!("{base_url}/content/data/{id}");
-                let (entries, _) = self.fetch_page(&url)?;
-                entries
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| Error::ComponentNotFound(format!("store content id {id}")))
-            })
-            .collect()
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(self.config.max_concurrent_requests)
+            .build()
+            .unwrap_or_else(|_| rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap());
+
+        pool.install(|| {
+            content_ids
+                .par_iter()
+                .map(|&id| {
+                    let base_url = self.config.base_url;
+                    let url = format!("{base_url}/content/data/{id}");
+                    let (entries, _) = self.fetch_page(&url)?;
+                    entries
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| Error::ComponentNotFound(format!("store content id {id}")))
+                })
+                .collect()
+        })
     }
 
     fn fetch_page(&self, url: &str) -> Result<(Vec<StoreEntry>, Meta)> {
         let mut backoff_ms = self.config.initial_backoff_ms;
 
         for attempt in 0..self.config.max_retries {
-            let response = {
-                self.request_count.fetch_add(1, Ordering::Relaxed);
-                let r = self.client.get(url).send()?;
-                let xml = r.text()?;
-                parse_ocs_response(&xml)
-            };
-            match response {
+            self.request_count.fetch_add(1, Ordering::Relaxed);
+            let resp = self.client.get(url).send()?;
+
+            // Detect HTTP-level rate limiting (429 Too Many Requests).
+            // Honor the Retry-After header when present; fall back to our backoff schedule.
+            if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                let sleep_ms = parse_retry_after_ms(&resp).unwrap_or(backoff_ms);
+                if attempt + 1 < self.config.max_retries {
+                    log::warn!(
+                        target: "api",
+                        "rate limited (HTTP 429), retrying after {}ms (attempt {}/{})",
+                        sleep_ms,
+                        attempt + 1,
+                        self.config.max_retries,
+                    );
+                    thread::sleep(Duration::from_millis(u64::from(sleep_ms)));
+                    backoff_ms = backoff_ms
+                        .saturating_mul(2)
+                        .min(self.config.max_backoff_ms);
+                    continue;
+                }
+                return Err(Error::RateLimited);
+            }
+
+            let xml = resp.text()?;
+            match parse_ocs_response(&xml) {
                 Ok(result) => return Ok(result),
+                Err(Error::RateLimited) if attempt + 1 < self.config.max_retries => {
+                    log::warn!(
+                        target: "api",
+                        "rate limited (OCS 200), retrying after {}ms (attempt {}/{})",
+                        backoff_ms,
+                        attempt + 1,
+                        self.config.max_retries,
+                    );
+                    thread::sleep(Duration::from_millis(u64::from(backoff_ms)));
+                    backoff_ms = backoff_ms
+                        .saturating_mul(2)
+                        .min(self.config.max_backoff_ms);
+                }
                 Err(_) if attempt + 1 < self.config.max_retries => {
-                    thread::sleep(Duration::from_millis(backoff_ms.into()));
-                    backoff_ms = backoff_ms.saturating_mul(2);
+                    thread::sleep(Duration::from_millis(u64::from(backoff_ms)));
+                    backoff_ms = backoff_ms
+                        .saturating_mul(2)
+                        .min(self.config.max_backoff_ms);
                 }
                 Err(e) => return Err(e),
             }
