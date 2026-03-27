@@ -38,6 +38,14 @@ struct Cli {
 
     #[arg(long, global = true, help = "skip KDE Plasma detection")]
     skip_plasma_detection: bool,
+
+    #[arg(
+        long,
+        global = true,
+        value_name = "N",
+        help = "maximum number of concurrent downloads [default: 4]"
+    )]
+    max_threads: Option<usize>,
 }
 
 #[derive(Subcommand)]
@@ -87,6 +95,11 @@ fn run(cli: Cli) -> Result<ExitCode, libplasmoid_updater::Error> {
     let mut config = CliConfig::load()?;
     config.inner.system = cli.system;
     config.inner.skip_plasma_detection = cli.skip_plasma_detection;
+
+    // CLI --max-threads overrides any value from the config file.
+    if let Some(n) = cli.max_threads {
+        config.inner.threads = Some(n);
+    }
 
     execute_command(&cli, &config)
 }

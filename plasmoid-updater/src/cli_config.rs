@@ -19,6 +19,7 @@ struct TomlConfig {
     update_all_by_default: bool,
     assume_yes: bool,
     prompt_restart: bool,
+    max_threads: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -62,6 +63,10 @@ impl CliConfig {
             } else {
                 libplasmoid_updater::RestartBehavior::Never
             });
+
+        if let Some(n) = toml_config.max_threads {
+            inner = inner.with_threads(n);
+        }
 
         if let Some(path) = widgets_id_path {
             let widgets_id_table = Self::load_widgets_id_table_from(path)?;
@@ -152,6 +157,7 @@ fn create_default_config(path: &Path) -> libplasmoid_updater::Result<()> {
 # update_all_by_default = false
 # assume_yes = false  # automatically confirm all updates without prompting
 # prompt_restart = true
+# max_threads = 4  # maximum number of concurrent downloads (reduce to 1-2 if you hit HTTP 429)
 "#;
     fs::write(path, default_content).map_err(|e| {
         libplasmoid_updater::Error::other(format!(

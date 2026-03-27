@@ -151,8 +151,9 @@ pub(crate) fn install_selected_updates(
     #[cfg(feature = "cli")]
     let ui = cli::update_ui::UpdateUi::new(updates);
 
-    // 0 = rayon default = number of logical CPUs
-    let thread_count = config.threads.unwrap_or(0);
+    // Default to 4 concurrent threads to avoid HTTP 429 rate-limiting from the KDE Store.
+    // Users can override this with Config::threads (e.g. via --max-threads on the CLI).
+    let thread_count = config.threads.unwrap_or(4);
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(thread_count)
         .build()
