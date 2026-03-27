@@ -177,6 +177,44 @@ fn patch_kpackage_structure(metadata_path: &Path, component_type: ComponentType)
     Ok(())
 }
 
+/// Scans the parent directory of `installed_component_path` and ensures every
+/// sibling package directory has the correct `KPackageStructure` in its
+/// `metadata.json`.  This pre-patches all packages so that `kpackagetool6 -u`
+/// doesn't exit non-zero because of unrelated packages that ship without the
+/// field (a common issue with plasmoids downloaded from the KDE Store).
+///
+/// Errors are logged and skipped rather than propagated — a failure to patch a
+/// sibling must never block the update of the target package.
+fn patch_sibling_kpackage_structures(installed_component_path: &Path, component_type: ComponentType) {
+    let Some(parent_dir) = installed_component_path.parent() else {
+        return;
+    };
+
+    let Ok(entries) = fs::read_dir(parent_dir) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+
+        let metadata_path = path.join("metadata.json");
+        if !metadata_path.exists() {
+            continue;
+        }
+
+        if let Err(e) = patch_kpackage_structure(&metadata_path, component_type) {
+            log::debug!(
+                target: "patch",
+                "could not patch KPackageStructure for {}: {e}",
+                path.display(),
+            );
+        }
+    }
+}
+
 /// Returns `true` when `error` is an `InstallFailed` whose entire kpackagetool6
 /// stderr consists exclusively of `KPackageStructure … does not match requested
 /// format` lines.  These messages are emitted for *other* packages in the same
@@ -236,11 +274,16 @@ fn install_via_kpackagetool(
         .map_err(|e| Error::install(format!("failed to run kpackagetool6: {e}")))?;
 
     if !output.status.success() {
+        // kpackagetool6 sends KPackageStructure warnings to stdout on some versions,
+        // stderr on others. Combine both so the fallback heuristic can inspect them.
+        let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(Error::install(format!(
-            "kpackagetool6 failed: {}",
-            stderr.trim()
-        )));
+        let combined = match (stdout.trim().is_empty(), stderr.trim().is_empty()) {
+            (false, false) => format!("{}\n{}", stdout.trim(), stderr.trim()),
+            (false, true) => stdout.trim().to_string(),
+            (_, _) => stderr.trim().to_string(),
+        };
+        return Err(Error::install(format!("kpackagetool6 failed: {combined}")));
     }
 
     Ok(())
@@ -269,18 +312,12 @@ pub(super) fn install_via_kpackage(
         log::warn!(target: "patch", "failed to patch metadata.desktop for {}: {e}", component.name);
     }
 
-    // Pre-patch the KPackageStructure in the *existing* installed package so
-    // that `kpackagetool6 -u` can validate it without a mismatch error.
-    let installed_metadata = component.path.join("metadata.json");
-    if installed_metadata.exists() {
-        if let Err(e) = patch_kpackage_structure(&installed_metadata, component.component_type) {
-            log::warn!(
-                target: "patch",
-                "failed to fix existing KPackageStructure for {}: {e}",
-                component.name,
-            );
-        }
-    }
+    // Pre-patch KPackageStructure in ALL packages in the same directory before
+    // running `kpackagetool6 -u`. kpackagetool6 validates every package in the
+    // directory, not just the one being updated, and exits non-zero if any of them
+    // have a missing or wrong KPackageStructure. This mirrors what the user must
+    // otherwise do manually.
+    patch_sibling_kpackage_structures(&component.path, component.component_type);
 
     let is_global = privilege::is_system_path(&component.path);
     match install_via_kpackagetool(&package_dir, component.component_type, is_global) {
