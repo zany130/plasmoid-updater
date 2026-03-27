@@ -32,6 +32,35 @@ pub use config::{Config, RestartBehavior};
 pub use error::Error;
 pub use types::{AvailableUpdate, ComponentType, Diagnostic, InstalledComponent};
 
+/// Result of a repair operation.
+///
+/// Returned by [`repair()`](crate::repair). Tracks which components were repaired
+/// and which failed during the repair run.
+#[derive(Debug, Clone, Default)]
+pub struct RepairResult {
+    /// Names of components whose `metadata.json` was successfully repaired.
+    pub repaired: Vec<String>,
+    /// Names of components that failed to repair, with the error message.
+    pub failed: Vec<(String, String)>,
+}
+
+impl RepairResult {
+    /// Returns `true` if any components were repaired.
+    pub fn has_repairs(&self) -> bool {
+        !self.repaired.is_empty()
+    }
+
+    /// Returns `true` if any repair attempts failed.
+    pub fn has_failures(&self) -> bool {
+        !self.failed.is_empty()
+    }
+
+    /// Returns `true` if nothing was repaired and no failures occurred.
+    pub fn is_clean(&self) -> bool {
+        self.repaired.is_empty() && self.failed.is_empty()
+    }
+}
+
 /// A specialized `Result` type for libplasmoid-updater operations.
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -242,4 +271,62 @@ pub fn show_installed(config: &Config) -> Result<()> {
     cli::output::print_components_table(&components);
 
     Ok(())
+}
+
+/// Scans installed plasmoids for malformed `metadata.json` files and repairs them.
+///
+/// Checks each installed component's `metadata.json` for a missing `KPackageStructure`
+/// field. When found missing, the correct value is inserted (e.g. `"Plasma/Applet"` for
+/// widgets). Only files that actually need fixing are modified.
+///
+/// This function is intended to be run explicitly via `plasmoid-updater repair`.
+/// It does **not** run automatically during normal updates.
+///
+/// # Errors
+///
+/// Returns an error if the filesystem scan fails.
+pub fn repair(config: &Config) -> Result<RepairResult> {
+    let components = checker::find_installed(config.system)?;
+    let mut result = RepairResult::default();
+
+    for component in components {
+        let Some(kpackage_type) = component.component_type.kpackage_type() else {
+            continue;
+        };
+
+        let metadata_path = component.path.join("metadata.json");
+        if !metadata_path.exists() {
+            continue;
+        }
+
+        match repair_metadata_json(&metadata_path, kpackage_type) {
+            Ok(true) => {
+                log::info!(target: "repair", "repaired {}: added KPackageStructure", component.name);
+                result.repaired.push(component.name);
+            }
+            Ok(false) => {}
+            Err(e) => {
+                log::warn!(target: "repair", "failed for {}: {e}", component.name);
+                result.failed.push((component.name, e.to_string()));
+            }
+        }
+    }
+
+    Ok(result)
+}
+
+fn repair_metadata_json(path: &std::path::Path, kpackage_type: &str) -> Result<bool> {
+    let content = std::fs::read_to_string(path)?;
+    let mut json: serde_json::Value =
+        serde_json::from_str(&content).map_err(Error::MetadataParse)?;
+
+    if json.get("KPackageStructure").is_some() {
+        return Ok(false);
+    }
+
+    json["KPackageStructure"] = serde_json::Value::String(kpackage_type.to_string());
+    let patched = serde_json::to_string_pretty(&json)?;
+    std::fs::write(path, &patched)?;
+
+    Ok(true)
 }
