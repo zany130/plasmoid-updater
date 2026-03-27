@@ -154,7 +154,59 @@ pub(super) fn patch_metadata_desktop(metadata_path: &Path, new_version: &str) ->
     Ok(())
 }
 
-// --- kpackagetool Installation ---
+/// Patches only the `KPackageStructure` field of a `metadata.json` file to match
+/// the given component type. A no-op if the field is already correct or if the
+/// component type has no kpackage type.
+fn patch_kpackage_structure(metadata_path: &Path, component_type: ComponentType) -> Result<()> {
+    let Some(kpackage_type) = component_type.kpackage_type() else {
+        return Ok(());
+    };
+
+    let content = fs::read_to_string(metadata_path)?;
+    let mut json: serde_json::Value =
+        serde_json::from_str(&content).map_err(Error::MetadataParse)?;
+
+    if json.get("KPackageStructure").and_then(|v| v.as_str()) == Some(kpackage_type) {
+        return Ok(());
+    }
+
+    json["KPackageStructure"] = serde_json::Value::String(kpackage_type.to_string());
+    let patched = serde_json::to_string_pretty(&json)?;
+    privilege::write_file(metadata_path, patched.as_bytes())?;
+
+    Ok(())
+}
+
+/// Returns `true` when `error` is an `InstallFailed` whose entire kpackagetool6
+/// stderr consists exclusively of `KPackageStructure … does not match requested
+/// format` lines.  These messages are emitted for *other* packages in the same
+/// directory and do not indicate that the target package itself failed to install.
+///
+/// The check relies on a substring of kpackagetool6's error output. If a future
+/// kpackagetool6 release changes this wording, the fallback copy path will simply
+/// not trigger and the original error will be reported instead — a safe default.
+fn is_kpackage_structure_only_error(error: &Error) -> bool {
+    let Error::InstallFailed(msg) = error else {
+        return false;
+    };
+
+    let body = msg
+        .strip_prefix("kpackagetool6 failed: ")
+        .unwrap_or(msg.as_str());
+
+    let mut has_lines = false;
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        has_lines = true;
+        if !trimmed.contains("does not match requested format") {
+            return false;
+        }
+    }
+    has_lines
+}
 
 /// Installs or updates a component package using `kpackagetool6`.
 fn install_via_kpackagetool(
@@ -217,8 +269,41 @@ pub(super) fn install_via_kpackage(
         log::warn!(target: "patch", "failed to patch metadata.desktop for {}: {e}", component.name);
     }
 
+    // Pre-patch the KPackageStructure in the *existing* installed package so
+    // that `kpackagetool6 -u` can validate it without a mismatch error.
+    let installed_metadata = component.path.join("metadata.json");
+    if installed_metadata.exists() {
+        if let Err(e) = patch_kpackage_structure(&installed_metadata, component.component_type) {
+            log::warn!(
+                target: "patch",
+                "failed to fix existing KPackageStructure for {}: {e}",
+                component.name,
+            );
+        }
+    }
+
     let is_global = privilege::is_system_path(&component.path);
-    install_via_kpackagetool(&package_dir, component.component_type, is_global)
+    match install_via_kpackagetool(&package_dir, component.component_type, is_global) {
+        Ok(()) => Ok(()),
+        Err(ref e) if is_kpackage_structure_only_error(e) => {
+            // kpackagetool6 exited non-zero solely because *other* already-installed
+            // packages in the same directory have an incorrect KPackageStructure.
+            // Those packages are unrelated to the one being updated; fall back to a
+            // direct directory replacement to bypass that validation entirely.
+            log::warn!(
+                target: "install",
+                "kpackagetool6 reported KPackageStructure mismatch(es) in other packages; \
+                 falling back to direct copy for {}",
+                component.name,
+            );
+            replace_destination(&component.path, || {
+                privilege::create_dir_all(&component.path)?;
+                privilege::copy_dir(&package_dir, &component.path)?;
+                Ok(())
+            })
+        }
+        Err(e) => Err(e),
+    }
 }
 
 // --- Component Locators ---

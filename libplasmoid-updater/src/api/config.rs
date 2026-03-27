@@ -4,7 +4,7 @@ use std::time::Duration;
 
 pub(crate) const DEFAULT_BASE_URL: &str = "https://api.kde-look.org/ocs/v1";
 pub(crate) const DEFAULT_PAGE_SIZE: u8 = 100;
-pub(crate) const DEFAULT_MAX_RETRIES: u8 = 5;
+pub(crate) const DEFAULT_MAX_RETRIES: u8 = 3;
 pub(crate) const DEFAULT_INITIAL_BACKOFF_MS: u32 = 500;
 pub(crate) const DEFAULT_MAX_BACKOFF_MS: u32 = 30_000;
 pub(crate) const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 2;

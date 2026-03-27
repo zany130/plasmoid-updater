@@ -36,6 +36,11 @@ fn parse_retry_after_ms(response: &reqwest::blocking::Response) -> Option<u32> {
         .map(|secs| secs.saturating_mul(1_000))
 }
 
+/// Converts a millisecond count (`u32`) to a [`Duration`].
+fn ms(millis: u32) -> Duration {
+    Duration::from_millis(u64::from(millis))
+}
+
 /// Thread-safe API client for KDE Store interactions.
 #[derive(Clone)]
 pub(crate) struct ApiClient {
@@ -130,10 +135,7 @@ impl ApiClient {
         let all_entries = Arc::new(Mutex::new(first_entries));
         let errors = Arc::new(Mutex::new(Vec::new()));
 
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(self.config.max_concurrent_requests)
-            .build()
-            .unwrap_or_else(|_| rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap());
+        let pool = self.build_request_pool();
 
         pool.install(|| {
             remaining_pages.par_iter().for_each(|&page| {
@@ -162,10 +164,7 @@ impl ApiClient {
 
     /// Fetches content details of multiple components.
     pub fn fetch_details(&self, content_ids: &[u64]) -> Vec<Result<StoreEntry>> {
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(self.config.max_concurrent_requests)
-            .build()
-            .unwrap_or_else(|_| rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap());
+        let pool = self.build_request_pool();
 
         pool.install(|| {
             content_ids
@@ -202,7 +201,7 @@ impl ApiClient {
                         attempt + 1,
                         self.config.max_retries,
                     );
-                    thread::sleep(Duration::from_millis(u64::from(sleep_ms)));
+                    thread::sleep(ms(sleep_ms));
                     backoff_ms = backoff_ms
                         .saturating_mul(2)
                         .min(self.config.max_backoff_ms);
@@ -222,13 +221,13 @@ impl ApiClient {
                         attempt + 1,
                         self.config.max_retries,
                     );
-                    thread::sleep(Duration::from_millis(u64::from(backoff_ms)));
+                    thread::sleep(ms(backoff_ms));
                     backoff_ms = backoff_ms
                         .saturating_mul(2)
                         .min(self.config.max_backoff_ms);
                 }
                 Err(_) if attempt + 1 < self.config.max_retries => {
-                    thread::sleep(Duration::from_millis(u64::from(backoff_ms)));
+                    thread::sleep(ms(backoff_ms));
                     backoff_ms = backoff_ms
                         .saturating_mul(2)
                         .min(self.config.max_backoff_ms);
