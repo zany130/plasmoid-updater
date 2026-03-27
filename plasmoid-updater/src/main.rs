@@ -8,7 +8,7 @@ use clap::{Parser, Subcommand};
 
 use cli_config::CliConfig;
 use exit_code::ExitCode;
-use libplasmoid_updater::{check, show_installed, update};
+use libplasmoid_updater::{check, repair, show_installed, update};
 
 #[derive(Parser)]
 #[command(name = "plasmoid-updater")]
@@ -38,6 +38,14 @@ struct Cli {
 
     #[arg(long, global = true, help = "skip KDE Plasma detection")]
     skip_plasma_detection: bool,
+
+    #[arg(
+        long,
+        global = true,
+        value_name = "N",
+        help = "maximum number of parallel downloads (default: 4)"
+    )]
+    max_threads: Option<usize>,
 }
 
 #[derive(Subcommand)]
@@ -46,6 +54,8 @@ enum Commands {
     Check,
     #[command(about = "list all installed components")]
     ListInstalled,
+    #[command(about = "repair malformed metadata.json files (adds missing KPackageStructure)")]
+    Repair,
     #[command(about = "update components")]
     Update {
         #[arg(help = "component name or directory to update")]
@@ -87,6 +97,7 @@ fn run(cli: Cli) -> Result<ExitCode, libplasmoid_updater::Error> {
     let mut config = CliConfig::load()?;
     config.inner.system = cli.system;
     config.inner.skip_plasma_detection = cli.skip_plasma_detection;
+    config.inner.threads = cli.max_threads.or(config.inner.threads).or(Some(4));
 
     execute_command(&cli, &config)
 }
@@ -100,6 +111,7 @@ fn execute_command(cli: &Cli, config: &CliConfig) -> Result<ExitCode, libplasmoi
         None => do_update(config, UpdateArgs::default()),
         Some(Commands::Check) => do_check(config),
         Some(Commands::ListInstalled) => do_list_installed(config),
+        Some(Commands::Repair) => do_repair(config),
         Some(Commands::Update {
             component,
             restart_plasma,
@@ -125,6 +137,28 @@ fn do_check(config: &CliConfig) -> Result<ExitCode, libplasmoid_updater::Error> 
 fn do_list_installed(config: &CliConfig) -> Result<ExitCode, libplasmoid_updater::Error> {
     show_installed(&config.inner)?;
     Ok(ExitCode::Success)
+}
+
+fn do_repair(config: &CliConfig) -> Result<ExitCode, libplasmoid_updater::Error> {
+    let result = repair(&config.inner)?;
+
+    if result.is_clean() {
+        println!("no repairs needed");
+        return Ok(ExitCode::Success);
+    }
+
+    for name in &result.repaired {
+        println!("repaired: {name}");
+    }
+
+    if result.has_failures() {
+        for (name, error) in &result.failed {
+            eprintln!("failed: {name}: {error}");
+        }
+        Ok(ExitCode::PartialFailure)
+    } else {
+        Ok(ExitCode::Success)
+    }
 }
 
 fn do_update(config: &CliConfig, args: UpdateArgs) -> Result<ExitCode, libplasmoid_updater::Error> {
